@@ -97,8 +97,8 @@ def get_feature_cols(panel: pd.DataFrame) -> list[str]:
         "date", "ticker", "week", "Open", "High", "Low", "Close", "Volume",
         "Adj Close", "target_1", "target_2", "target_quantile", "fwd_open_to_open",
     }
-    numeric = {np.float64, np.float32, np.int64, np.int32}
-    return [c for c in panel.columns if c not in exclude and panel[c].dtype in numeric]
+    numeric_cols = panel.select_dtypes(include=[np.number]).columns.tolist()
+    return [c for c in numeric_cols if c not in exclude]
 
 
 def prepare_arrays(
@@ -107,9 +107,17 @@ def prepare_arrays(
     feature_cols: list[str],
     target_col: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not feature_cols:
+        raise ValueError(
+            "No numeric feature columns found. Ensure parquet contains engineered numeric features."
+        )
+
+    train_features = train[feature_cols].apply(pd.to_numeric, errors="coerce")
+    test_features = test[feature_cols].apply(pd.to_numeric, errors="coerce")
+
     imputer = SimpleImputer(strategy="median")
-    X_train = np.clip(imputer.fit_transform(train[feature_cols]), -100, 100)
-    X_test = np.clip(imputer.transform(test[feature_cols]), -100, 100)
+    X_train = np.clip(imputer.fit_transform(train_features), -100, 100)
+    X_test = np.clip(imputer.transform(test_features), -100, 100)
     y_train = train[target_col].values.astype(int)
     y_test = test[target_col].values.astype(int)
     idx = test.index.to_numpy()
@@ -150,6 +158,11 @@ def run_tabicl_from_parquet(
     panel["date"] = pd.to_datetime(panel["date"])
 
     train_df, test_df = temporal_split(panel, train_years=train_years, test_years=test_years)
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            "Temporal split produced empty train/test set. Check date range and split years."
+        )
+
     feature_cols = get_feature_cols(panel)
     X_train, y_train, X_test, y_test, test_index = prepare_arrays(train_df, test_df, feature_cols, target_col)
 
