@@ -577,38 +577,38 @@ def update_ticker(
         ok = process_ticker(ticker, api_key, start, end, cache_dir, delay)
         return "NEW" if ok else "FAIL"
 
-    # Check whether there is anything new to fetch
-    fetch_from = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    if fetch_from > end:
-        return "UP_TO_DATE"
-
     try:
-        # ── 1. Fetch new daily bars ────────────────────────────────────────
-        new_bars = _download_daily_raw(ticker, api_key, fetch_from, end)
-        time.sleep(delay)
-
-        # ── 2. Load existing raw OHLCV and append ─────────────────────────
         raw_path = cache_dir / "raw" / f"{ticker}.parquet"
+
+        # ── 1. Fetch new daily price bars (if any) ────────────────────────
+        fetch_from = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        prices_current = fetch_from > end
+
         existing_raw = pd.read_parquet(raw_path)
         existing_raw["date"] = pd.to_datetime(existing_raw["date"])
         existing_raw = existing_raw.set_index("date")
 
-        if new_bars.empty:
-            # No new price data but we still refresh fundamentals below
-            daily_raw = existing_raw
-            got_new_prices = False
-        else:
-            # Deduplicate by keeping the freshly downloaded version of any overlap
-            combined = pd.concat([existing_raw, new_bars])
-            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-            daily_raw = combined
-            got_new_prices = True
-            daily_raw.reset_index().to_parquet(raw_path, index=False)
+        got_new_prices = False
+        if not prices_current:
+            new_bars = _download_daily_raw(ticker, api_key, fetch_from, end)
+            time.sleep(delay)
 
-        # ── 3. Re-fetch quarterly fundamentals ────────────────────────────
+            if not new_bars.empty:
+                combined = pd.concat([existing_raw, new_bars])
+                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+                existing_raw = combined
+                got_new_prices = True
+                existing_raw.reset_index().to_parquet(raw_path, index=False)
+
+        daily_raw = existing_raw
+
+        # ── 2. Always re-fetch quarterly fundamentals ─────────────────────
+        # Quarterly reports land weeks after quarter-end on a different schedule
+        # from price data, so we refresh them unconditionally on every --update
+        # run regardless of whether new price bars were found.
         fundamentals = download_quarterly_fundamentals(ticker, api_key, delay)
 
-        # ── 4. Recompute all derived caches from full raw series ───────────
+        # ── 3. Recompute all derived caches from full raw series ───────────
         _rebuild_derived_caches(ticker, daily_raw, fundamentals, cache_dir)
 
         return "UPDATED" if got_new_prices else "UP_TO_DATE"
