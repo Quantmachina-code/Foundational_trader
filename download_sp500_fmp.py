@@ -34,6 +34,7 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -116,15 +117,18 @@ def get_sp500_tickers(api_key: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def download_prices(ticker: str, api_key: str, start: str, end: str) -> pd.DataFrame:
-    """Download daily OHLCV from FMP and resample to weekly bars (week-ending Friday).
+    """Download daily OHLCV, compute indicators on both timeframes, return weekly bars.
 
-    Weekly OHLCV convention:
-      open     – price on the first trading day of the week
-      high     – highest intraday price during the week
-      low      – lowest intraday price during the week
-      close    – price on the last trading day of the week
-      adjClose – adjusted close on the last trading day of the week
-      volume   – total shares traded during the week
+    Pipeline
+    --------
+    1. Download daily OHLCV from FMP.
+    2. Compute daily technical indicators (EMA/SMA/RSI/MACD/vol on daily bars).
+    3. Resample everything to week-ending-Friday bars:
+         OHLCV  → open=first, high=max, low=min, close/adjClose=last, volume=sum
+         indicators → last value of the week
+    4. Compute weekly technical indicators on the weekly bars
+       (lagged returns, weekly EMA/SMA, weekly RSI/MACD/BB/ATR/momentum).
+    5. Return the combined weekly DataFrame.
     """
     data = _fmp_get(
         f"historical-price-full/{ticker}",
@@ -141,30 +145,210 @@ def download_prices(ticker: str, api_key: str, start: str, end: str) -> pd.DataF
     keep = ["open", "high", "low", "close", "adjClose", "volume"]
     daily = df[[c for c in keep if c in df.columns]].astype(float, errors="ignore")
 
-    return _resample_to_weekly(daily)
+    daily_with_ind = compute_daily_indicators(daily)
+    weekly = _resample_to_weekly(daily_with_ind)
+    return compute_weekly_indicators(weekly)
+
+
+# ---------------------------------------------------------------------------
+# Technical indicator helpers
+# ---------------------------------------------------------------------------
+
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    """Wilder-smoothed RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def compute_daily_indicators(daily: pd.DataFrame) -> pd.DataFrame:
+    """Compute technical indicators on daily OHLCV bars.
+
+    Indicators are prefixed with ``d_`` to distinguish them from the weekly
+    equivalents once both are present in the final row.  All columns are
+    resampled to weekly with ``"last"`` (end-of-week snapshot).
+
+    Indicators computed
+    -------------------
+    SMAs        : 20d, 50d, 200d  (price-relative ratio)
+    EMAs        : 12d, 20d, 26d, 50d, 200d
+    RSI         : 14d
+    MACD        : 12-26-9  (line, signal, histogram, price-normalised)
+    Log returns : 1d
+    Volatility  : rolling 20d and 60d annualised (√252)
+    """
+    df = daily.copy()
+    close = df["close"]
+
+    # SMAs
+    for n in [20, 50, 200]:
+        sma = close.rolling(n).mean()
+        df[f"d_sma_{n}"] = sma
+        df[f"d_c_vs_sma_{n}"] = close / sma - 1
+
+    # EMAs
+    for n in [12, 20, 26, 50, 200]:
+        ema = close.ewm(span=n, adjust=False).mean()
+        df[f"d_ema_{n}"] = ema
+        df[f"d_c_vs_ema_{n}"] = close / ema - 1
+
+    # RSI 14d
+    df["d_rsi_14"] = _rsi(close, 14)
+
+    # MACD (12-26-9)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["d_macd"] = ema12 - ema26
+    df["d_macd_signal"] = df["d_macd"].ewm(span=9, adjust=False).mean()
+    df["d_macd_hist"] = df["d_macd"] - df["d_macd_signal"]
+    df["d_macd_norm"] = df["d_macd"] / close
+
+    # Log return and vol
+    log_ret = np.log(close / close.shift(1))
+    df["d_log_ret_1"] = log_ret
+    df["d_vol_20"] = log_ret.rolling(20).std() * np.sqrt(252)
+    df["d_vol_60"] = log_ret.rolling(60).std() * np.sqrt(252)
+
+    return df
 
 
 def _resample_to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
-    """Resample a daily OHLCV DataFrame to week-ending-Friday bars."""
-    agg: dict[str, str] = {}
-    if "open" in daily.columns:
-        agg["open"] = "first"
-    if "high" in daily.columns:
-        agg["high"] = "max"
-    if "low" in daily.columns:
-        agg["low"] = "min"
-    if "close" in daily.columns:
-        agg["close"] = "last"
-    if "adjClose" in daily.columns:
-        agg["adjClose"] = "last"
-    if "volume" in daily.columns:
-        agg["volume"] = "sum"
+    """Resample a daily DataFrame (OHLCV + indicators) to week-ending-Friday bars.
 
-    # W-FRI: week label is the Friday that closes the week
+    OHLCV columns use their natural aggregation; every other column (indicators)
+    takes the last value of the week.
+    """
+    OHLCV_AGG = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "adjClose": "last",
+        "volume": "sum",
+    }
+    agg: dict[str, str] = {}
+    for col in daily.columns:
+        agg[col] = OHLCV_AGG.get(col, "last")
+
     weekly = daily.resample("W-FRI").agg(agg)
-    # Drop weeks where no trading occurred (e.g. holiday weeks at boundaries)
-    weekly = weekly.dropna(subset=["close"] if "close" in weekly.columns else weekly.columns[:1])
+    ref = "close" if "close" in weekly.columns else weekly.columns[0]
+    weekly = weekly.dropna(subset=[ref])
     return weekly
+
+
+def compute_weekly_indicators(weekly: pd.DataFrame) -> pd.DataFrame:
+    """Compute technical indicators directly on weekly OHLCV bars.
+
+    All column names are prefixed ``w_``.
+
+    Indicators computed
+    -------------------
+    Lagged returns  : 1w, 2w, 3w, 4w, 1q (13w)  — simple and log
+    SMAs            : 4w, 8w, 13w, 26w, 52w  + price-relative ratio
+    EMAs            : 4w, 8w, 13w, 26w, 52w  + price-relative ratio
+    MA crossovers   : sma 4/13, 8/26 ; ema 4/13, 8/26
+    RSI             : 14w, 26w
+    MACD            : 12-26-9  (line, signal, hist, normalised)
+    Rate of change  : 4w, 13w, 26w, 52w
+    Volatility      : rolling 4w, 13w, 26w, 52w  annualised (√52)
+    ATR             : 14w  (and as % of close)
+    Bollinger Bands : 20w ×2σ  (%, width)
+    Volume ratios   : 4w, 13w  (vs rolling mean)
+    """
+    df = weekly.copy()
+    close = df["close"]
+
+    # ------------------------------------------------------------------
+    # Lagged returns
+    # ------------------------------------------------------------------
+    for n, label in [(1, "1w"), (2, "2w"), (3, "3w"), (4, "4w"), (13, "1q")]:
+        df[f"w_ret_{label}"] = close.pct_change(n)
+        df[f"w_log_ret_{label}"] = np.log(close / close.shift(n))
+
+    # ------------------------------------------------------------------
+    # SMAs and EMAs
+    # ------------------------------------------------------------------
+    for n in [4, 8, 13, 26, 52]:
+        sma = close.rolling(n).mean()
+        df[f"w_sma_{n}"] = sma
+        df[f"w_c_vs_sma_{n}"] = close / sma - 1
+
+        ema = close.ewm(span=n, adjust=False).mean()
+        df[f"w_ema_{n}"] = ema
+        df[f"w_c_vs_ema_{n}"] = close / ema - 1
+
+    # MA crossovers (ratio > 0 means shorter MA above longer MA)
+    for s, l in [(4, 13), (8, 26)]:
+        df[f"w_sma_{s}_{l}_cross"] = df[f"w_sma_{s}"] / df[f"w_sma_{l}"] - 1
+        df[f"w_ema_{s}_{l}_cross"] = df[f"w_ema_{s}"] / df[f"w_ema_{l}"] - 1
+
+    # ------------------------------------------------------------------
+    # RSI
+    # ------------------------------------------------------------------
+    df["w_rsi_14"] = _rsi(close, 14)
+    df["w_rsi_26"] = _rsi(close, 26)
+
+    # ------------------------------------------------------------------
+    # MACD (12-26-9)
+    # ------------------------------------------------------------------
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["w_macd"] = ema12 - ema26
+    df["w_macd_signal"] = df["w_macd"].ewm(span=9, adjust=False).mean()
+    df["w_macd_hist"] = df["w_macd"] - df["w_macd_signal"]
+    df["w_macd_norm"] = df["w_macd"] / close
+
+    # ------------------------------------------------------------------
+    # Rate of change / momentum
+    # ------------------------------------------------------------------
+    for n, label in [(4, "4w"), (13, "1q"), (26, "2q"), (52, "1y")]:
+        df[f"w_roc_{label}"] = close / close.shift(n) - 1
+
+    # ------------------------------------------------------------------
+    # Historical volatility (annualised, √52 weeks/year)
+    # ------------------------------------------------------------------
+    log_ret_1w = np.log(close / close.shift(1))
+    for n, label in [(4, "4w"), (13, "1q"), (26, "2q"), (52, "1y")]:
+        df[f"w_vol_{label}"] = log_ret_1w.rolling(n).std() * np.sqrt(52)
+
+    # ------------------------------------------------------------------
+    # ATR (14w)
+    # ------------------------------------------------------------------
+    if {"high", "low", "close"}.issubset(df.columns):
+        prev_close = df["close"].shift(1)
+        tr = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        df["w_atr_14"] = tr.rolling(14).mean()
+        df["w_atr_pct_14"] = df["w_atr_14"] / close
+
+    # ------------------------------------------------------------------
+    # Bollinger Bands (20w, 2σ)
+    # ------------------------------------------------------------------
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    bb_upper = sma20 + 2 * std20
+    bb_lower = sma20 - 2 * std20
+    band_width = (bb_upper - bb_lower).replace(0, float("nan"))
+    df["w_bb_pct_20"] = (close - bb_lower) / band_width
+    df["w_bb_width_20"] = band_width / sma20
+
+    # ------------------------------------------------------------------
+    # Volume ratios
+    # ------------------------------------------------------------------
+    if "volume" in df.columns:
+        vol = df["volume"]
+        df["w_vol_ratio_4"] = vol / vol.rolling(4).mean()
+        df["w_vol_ratio_13"] = vol / vol.rolling(13).mean()
+
+    return df
 
 
 def download_quarterly_fundamentals(
