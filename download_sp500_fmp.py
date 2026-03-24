@@ -1,8 +1,14 @@
-"""Download S&P 500 historical price and quarterly fundamental data via FMP API.
+"""Download S&P 500 weekly price and quarterly fundamental data via FMP API.
+
+Price data is downloaded daily from FMP then resampled to weekly bars
+(week ending Friday): Open=first day, High=max, Low=min, Close/adjClose=last
+day, Volume=sum.
 
 Quarterly fundamentals are shifted forward by one quarter to avoid look-ahead
 bias: Q1 data (period ending 2023-03-31) is only treated as known from
 2023-06-30 onward, since earnings are typically reported weeks after quarter-end.
+The shifted quarterly values are forward-filled into every weekly row until the
+next quarter's data becomes available.
 
 Download is gradual — one ticker at a time — and each ticker is cached as its
 own parquet file so the script can be interrupted and resumed safely.
@@ -110,7 +116,16 @@ def get_sp500_tickers(api_key: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def download_prices(ticker: str, api_key: str, start: str, end: str) -> pd.DataFrame:
-    """Daily OHLCV + adjusted close for *ticker* between *start* and *end*."""
+    """Download daily OHLCV from FMP and resample to weekly bars (week-ending Friday).
+
+    Weekly OHLCV convention:
+      open     – price on the first trading day of the week
+      high     – highest intraday price during the week
+      low      – lowest intraday price during the week
+      close    – price on the last trading day of the week
+      adjClose – adjusted close on the last trading day of the week
+      volume   – total shares traded during the week
+    """
     data = _fmp_get(
         f"historical-price-full/{ticker}",
         api_key,
@@ -123,9 +138,33 @@ def download_prices(ticker: str, api_key: str, start: str, end: str) -> pd.DataF
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").set_index("date")
 
-    keep = ["open", "high", "low", "close", "adjClose", "volume", "changePercent", "vwap"]
-    available = [c for c in keep if c in df.columns]
-    return df[available].astype(float, errors="ignore")
+    keep = ["open", "high", "low", "close", "adjClose", "volume"]
+    daily = df[[c for c in keep if c in df.columns]].astype(float, errors="ignore")
+
+    return _resample_to_weekly(daily)
+
+
+def _resample_to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
+    """Resample a daily OHLCV DataFrame to week-ending-Friday bars."""
+    agg: dict[str, str] = {}
+    if "open" in daily.columns:
+        agg["open"] = "first"
+    if "high" in daily.columns:
+        agg["high"] = "max"
+    if "low" in daily.columns:
+        agg["low"] = "min"
+    if "close" in daily.columns:
+        agg["close"] = "last"
+    if "adjClose" in daily.columns:
+        agg["adjClose"] = "last"
+    if "volume" in daily.columns:
+        agg["volume"] = "sum"
+
+    # W-FRI: week label is the Friday that closes the week
+    weekly = daily.resample("W-FRI").agg(agg)
+    # Drop weeks where no trading occurred (e.g. holiday weeks at boundaries)
+    weekly = weekly.dropna(subset=["close"] if "close" in weekly.columns else weekly.columns[:1])
+    return weekly
 
 
 def download_quarterly_fundamentals(
@@ -199,10 +238,11 @@ def merge_price_and_fundamentals(
     prices: pd.DataFrame,
     fundamentals: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Left-join fundamentals onto daily prices and forward-fill quarterly values.
+    """Left-join fundamentals onto weekly prices and forward-fill quarterly values.
 
-    Forward-fill carries the most-recently-available quarterly figure forward
-    until the next quarter's data becomes available.
+    Quarterly data arrives at most once every ~13 weekly bars.  Forward-fill
+    carries the most-recently-available figure forward until the next (shifted)
+    quarter date falls within the weekly index.
     """
     if fundamentals.empty:
         return prices.copy()
@@ -249,8 +289,8 @@ def process_ticker(
         prices = download_prices(ticker, api_key, start, end)
         time.sleep(delay)
 
-        if prices.empty or len(prices) < 30:
-            # Too little data — not worth caching
+        if prices.empty or len(prices) < 10:
+            # Fewer than 10 weekly bars — not worth caching
             return False
 
         fundamentals = download_quarterly_fundamentals(ticker, api_key, delay)
@@ -299,7 +339,7 @@ def build_combined_parquet(cache_dir: Path, output_path: Path) -> pd.DataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download S&P 500 price + quarterly fundamentals from FMP and save to parquet.",
+        description="Download S&P 500 weekly price + quarterly fundamentals from FMP and save to parquet.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--api-key", required=True, help="FMP API key.")
