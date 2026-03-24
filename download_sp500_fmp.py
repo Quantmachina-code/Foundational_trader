@@ -409,16 +409,104 @@ def _merge_fundamentals(prices: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.
 
 
 # ---------------------------------------------------------------------------
-# Per-ticker processing  →  three cache files
+# Per-ticker processing  →  four cache files
 # ---------------------------------------------------------------------------
+#
+# Cache layout
+# ─────────────────────────────────────────────────────────────────────────
+# cache_dir/
+#   raw/{TICKER}.parquet        Pure daily OHLCV — source of truth for updates.
+#                               Rolling indicators need the full history to warm
+#                               up (e.g. SMA-200), so we always recompute from
+#                               the complete raw series after appending new bars.
+#   daily/{TICKER}.parquet      Daily OHLCV + d_* indicators + fundamentals ffilled.
+#   weekly/{TICKER}.parquet     Weekly OHLCV + d_* (end-of-week) + w_* indicators
+#                               + fundamentals ffilled.
+#   quarterly/{TICKER}.parquet  Raw shifted quarterly rows — sparse, no ffill.
+# ─────────────────────────────────────────────────────────────────────────
+
 
 def _ticker_is_cached(ticker: str, cache_dir: Path) -> bool:
-    """True only when all three frequency cache files exist for this ticker."""
+    """True only when all four cache files (raw + three frequencies) exist."""
     return (
-        (cache_dir / "daily" / f"{ticker}.parquet").exists()
+        (cache_dir / "raw" / f"{ticker}.parquet").exists()
+        and (cache_dir / "daily" / f"{ticker}.parquet").exists()
         and (cache_dir / "weekly" / f"{ticker}.parquet").exists()
         and (cache_dir / "quarterly" / f"{ticker}.parquet").exists()
     )
+
+
+def _last_cached_date(ticker: str, cache_dir: Path) -> pd.Timestamp | None:
+    """Return the most recent date in the raw OHLCV cache for *ticker*.
+
+    If the raw cache doesn't exist but the daily cache does (i.e. data was
+    downloaded before the raw sub-cache was introduced), the OHLCV columns are
+    extracted from the daily cache and saved as the raw cache automatically —
+    no API call needed.
+
+    Returns None if no cache exists at all.
+    """
+    raw_path = cache_dir / "raw" / f"{ticker}.parquet"
+
+    if not raw_path.exists():
+        daily_path = cache_dir / "daily" / f"{ticker}.parquet"
+        if not daily_path.exists():
+            return None
+        # Migration: reconstruct raw cache from existing daily cache
+        daily_df = pd.read_parquet(daily_path)
+        daily_df["date"] = pd.to_datetime(daily_df["date"])
+        ohlcv_cols = [c for c in _OHLCV_AGG if c in daily_df.columns]
+        raw = daily_df[["date"] + ohlcv_cols].set_index("date")
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw.reset_index().to_parquet(raw_path, index=False)
+
+    raw_df = pd.read_parquet(raw_path, columns=["date"])
+    return pd.to_datetime(raw_df["date"]).max()
+
+
+def _rebuild_derived_caches(
+    ticker: str,
+    daily_raw: pd.DataFrame,
+    fundamentals: pd.DataFrame,
+    cache_dir: Path,
+) -> bool:
+    """Compute and save daily / weekly / quarterly cache files from raw inputs.
+
+    *daily_raw* must be a date-indexed DataFrame of pure OHLCV columns.
+    Returns False if there is too little data to be useful.
+    """
+    for sub in ("daily", "weekly", "quarterly"):
+        (cache_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    daily_with_ind = compute_daily_indicators(daily_raw)
+
+    # Daily
+    daily_full = _merge_fundamentals(daily_with_ind, fundamentals)
+    daily_full.insert(0, "ticker", ticker)
+    daily_full.reset_index().to_parquet(
+        cache_dir / "daily" / f"{ticker}.parquet", index=False
+    )
+
+    # Weekly
+    weekly_raw = _resample_to_weekly(daily_with_ind)
+    if len(weekly_raw) < 10:
+        return False
+    weekly_with_ind = compute_weekly_indicators(weekly_raw)
+    weekly_full = _merge_fundamentals(weekly_with_ind, fundamentals)
+    weekly_full.insert(0, "ticker", ticker)
+    weekly_full.reset_index().to_parquet(
+        cache_dir / "weekly" / f"{ticker}.parquet", index=False
+    )
+
+    # Quarterly (sparse — raw shifted rows, no ffill)
+    if not fundamentals.empty:
+        q = fundamentals.copy()
+        q.insert(0, "ticker", ticker)
+        q.reset_index().to_parquet(
+            cache_dir / "quarterly" / f"{ticker}.parquet", index=False
+        )
+
+    return True
 
 
 def process_ticker(
@@ -429,72 +517,105 @@ def process_ticker(
     cache_dir: Path,
     delay: float,
 ) -> bool:
-    """Download and cache one ticker at all three frequencies.
-
-    Cache layout
-    ------------
-    cache_dir/daily/{TICKER}.parquet
-        Daily OHLCV + d_* indicators + quarterly fundamentals (ffilled).
-
-    cache_dir/weekly/{TICKER}.parquet
-        Weekly OHLCV + d_* end-of-week snapshot + w_* indicators
-        + quarterly fundamentals (ffilled).
-
-    cache_dir/quarterly/{TICKER}.parquet
-        Raw shifted quarterly rows — no forward-fill, sparse by design.
-
-    Returns True on success, False if data is missing or an error occurs.
-    """
+    """Full historical download and cache for one ticker.  Returns True on success."""
     if _ticker_is_cached(ticker, cache_dir):
         return True
 
-    # Create sub-directories up front
-    for sub in ("daily", "weekly", "quarterly"):
-        (cache_dir / sub).mkdir(parents=True, exist_ok=True)
+    (cache_dir / "raw").mkdir(parents=True, exist_ok=True)
 
     try:
-        # ── 1. Daily OHLCV ────────────────────────────────────────────────
         daily_raw = _download_daily_raw(ticker, api_key, start, end)
         time.sleep(delay)
 
         if daily_raw.empty or len(daily_raw) < 30:
-            return False  # need at least 30 trading days
+            return False
 
-        # ── 2. Quarterly fundamentals ─────────────────────────────────────
+        # Save raw OHLCV — source of truth for future incremental updates
+        daily_raw.reset_index().to_parquet(
+            cache_dir / "raw" / f"{ticker}.parquet", index=False
+        )
+
         fundamentals = download_quarterly_fundamentals(ticker, api_key, delay)
-
-        # ── 3. Daily dataset ──────────────────────────────────────────────
-        daily_with_ind = compute_daily_indicators(daily_raw)
-        daily_full = _merge_fundamentals(daily_with_ind, fundamentals)
-        daily_full.insert(0, "ticker", ticker)
-        daily_full.reset_index().to_parquet(
-            cache_dir / "daily" / f"{ticker}.parquet", index=False
-        )
-
-        # ── 4. Weekly dataset ─────────────────────────────────────────────
-        weekly_raw = _resample_to_weekly(daily_with_ind)  # carries d_* via "last"
-        if len(weekly_raw) < 10:
-            return False  # need at least 10 weeks
-        weekly_with_ind = compute_weekly_indicators(weekly_raw)
-        weekly_full = _merge_fundamentals(weekly_with_ind, fundamentals)
-        weekly_full.insert(0, "ticker", ticker)
-        weekly_full.reset_index().to_parquet(
-            cache_dir / "weekly" / f"{ticker}.parquet", index=False
-        )
-
-        # ── 5. Quarterly dataset ──────────────────────────────────────────
-        if not fundamentals.empty:
-            q = fundamentals.copy()
-            q.insert(0, "ticker", ticker)
-            q.reset_index().to_parquet(
-                cache_dir / "quarterly" / f"{ticker}.parquet", index=False
-            )
-
-        return True
+        return _rebuild_derived_caches(ticker, daily_raw, fundamentals, cache_dir)
 
     except Exception as exc:
         print(f"    ERROR: {exc}")
         return False
+
+
+def update_ticker(
+    ticker: str,
+    api_key: str,
+    start: str,
+    end: str,
+    cache_dir: Path,
+    delay: float,
+) -> str:
+    """Incrementally update one ticker's cache with new data up to *end*.
+
+    Behaviour
+    ---------
+    New ticker (no cache at all)
+        Falls back to a full historical download from *start*.
+
+    Existing ticker
+        1. Reads the raw OHLCV cache to find the last stored date.
+        2. Fetches only new daily bars from (last_date + 1 calendar day) to *end*.
+           If the remote returns no new rows the ticker is already up to date.
+        3. Always re-fetches quarterly fundamentals (cheap — 3 requests) so that
+           newly reported quarters and any restatements are captured.
+        4. Appends new bars to the raw cache, then recomputes ALL indicators and
+           derived caches from the full raw series so that rolling windows
+           (e.g. SMA-200) are correctly initialised.
+
+    Returns one of: ``"NEW"`` | ``"UPDATED"`` | ``"UP_TO_DATE"`` | ``"FAIL"``
+    """
+    last_date = _last_cached_date(ticker, cache_dir)
+
+    if last_date is None:
+        # Brand-new ticker — full download
+        ok = process_ticker(ticker, api_key, start, end, cache_dir, delay)
+        return "NEW" if ok else "FAIL"
+
+    # Check whether there is anything new to fetch
+    fetch_from = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    if fetch_from > end:
+        return "UP_TO_DATE"
+
+    try:
+        # ── 1. Fetch new daily bars ────────────────────────────────────────
+        new_bars = _download_daily_raw(ticker, api_key, fetch_from, end)
+        time.sleep(delay)
+
+        # ── 2. Load existing raw OHLCV and append ─────────────────────────
+        raw_path = cache_dir / "raw" / f"{ticker}.parquet"
+        existing_raw = pd.read_parquet(raw_path)
+        existing_raw["date"] = pd.to_datetime(existing_raw["date"])
+        existing_raw = existing_raw.set_index("date")
+
+        if new_bars.empty:
+            # No new price data but we still refresh fundamentals below
+            daily_raw = existing_raw
+            got_new_prices = False
+        else:
+            # Deduplicate by keeping the freshly downloaded version of any overlap
+            combined = pd.concat([existing_raw, new_bars])
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            daily_raw = combined
+            got_new_prices = True
+            daily_raw.reset_index().to_parquet(raw_path, index=False)
+
+        # ── 3. Re-fetch quarterly fundamentals ────────────────────────────
+        fundamentals = download_quarterly_fundamentals(ticker, api_key, delay)
+
+        # ── 4. Recompute all derived caches from full raw series ───────────
+        _rebuild_derived_caches(ticker, daily_raw, fundamentals, cache_dir)
+
+        return "UPDATED" if got_new_prices else "UP_TO_DATE"
+
+    except Exception as exc:
+        print(f"    ERROR: {exc}")
+        return "FAIL"
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +686,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--cache-dir", default="fmp_ticker_cache",
-        help="Root directory for per-ticker cache files (sub-dirs: daily/, weekly/, quarterly/).",
+        help="Root cache directory (sub-dirs: raw/, daily/, weekly/, quarterly/).",
     )
     parser.add_argument(
         "--delay", type=float, default=0.25,
@@ -581,6 +702,14 @@ def main() -> None:
     parser.add_argument(
         "--rebuild", action="store_true",
         help="Skip downloading; just rebuild the three parquets from existing cache.",
+    )
+    parser.add_argument(
+        "--update", action="store_true",
+        help=(
+            "Incremental update mode: for each ticker fetch only new bars since "
+            "the last cached date, always re-fetch quarterly fundamentals, then "
+            "recompute all indicators.  New or missing tickers get a full download."
+        ),
     )
     args = parser.parse_args()
 
@@ -617,33 +746,55 @@ def main() -> None:
         tickers = tickers[: args.limit]
         print(f"  Limiting to first {args.limit} tickers.")
 
-    already_done = sum(1 for t in tickers if _ticker_is_cached(t, cache_dir))
-    print(f"  Fully cached: {already_done}/{len(tickers)}  |  To download: {len(tickers) - already_done}\n")
+    # ------------------------------------------------------------------
+    # 2a. UPDATE mode — incremental fetch for each ticker
+    # ------------------------------------------------------------------
+    if args.update:
+        cached_count = sum(1 for t in tickers if _last_cached_date(t, cache_dir) is not None)
+        new_count = len(tickers) - cached_count
+        print(f"  Update mode — cached: {cached_count}  |  new (full download): {new_count}\n")
+
+        counts: dict[str, int] = {"NEW": 0, "UPDATED": 0, "UP_TO_DATE": 0, "FAIL": 0}
+        for idx, ticker in enumerate(tickers, 1):
+            print(f"[{idx:3d}/{len(tickers)}] {ticker:<6s}", end="", flush=True)
+            status = update_ticker(
+                ticker, args.api_key, args.start, args.end, cache_dir, args.delay
+            )
+            counts[status] += 1
+            print(f"  {status}")
+
+        print(
+            f"\nUpdate summary: {counts['NEW']} new  |  {counts['UPDATED']} updated  "
+            f"|  {counts['UP_TO_DATE']} up-to-date  |  {counts['FAIL']} failed"
+        )
 
     # ------------------------------------------------------------------
-    # 2. Download each ticker → three cache files
+    # 2b. FULL DOWNLOAD mode — skip already-complete tickers
     # ------------------------------------------------------------------
-    success = skip = fail = 0
+    else:
+        already_done = sum(1 for t in tickers if _ticker_is_cached(t, cache_dir))
+        print(f"  Fully cached: {already_done}/{len(tickers)}  |  To download: {len(tickers) - already_done}\n")
 
-    for idx, ticker in enumerate(tickers, 1):
-        cached = _ticker_is_cached(ticker, cache_dir)
-        tag = "SKIP" if cached else "…   "
-        print(f"[{idx:3d}/{len(tickers)}] {ticker:<6s}  {tag}", end="", flush=True)
+        success = skip = fail = 0
+        for idx, ticker in enumerate(tickers, 1):
+            cached = _ticker_is_cached(ticker, cache_dir)
+            tag = "SKIP" if cached else "…   "
+            print(f"[{idx:3d}/{len(tickers)}] {ticker:<6s}  {tag}", end="", flush=True)
 
-        if cached:
-            skip += 1
-            print()
-            continue
+            if cached:
+                skip += 1
+                print()
+                continue
 
-        ok = process_ticker(ticker, args.api_key, args.start, args.end, cache_dir, args.delay)
-        if ok:
-            success += 1
-            print("  OK")
-        else:
-            fail += 1
-            print("  FAIL")
+            ok = process_ticker(ticker, args.api_key, args.start, args.end, cache_dir, args.delay)
+            if ok:
+                success += 1
+                print("  OK")
+            else:
+                fail += 1
+                print("  FAIL")
 
-    print(f"\nDownload complete: {success} new  |  {skip} cached  |  {fail} failed")
+        print(f"\nDownload complete: {success} new  |  {skip} cached  |  {fail} failed")
 
     # ------------------------------------------------------------------
     # 3. Merge all cache files → three final parquets
