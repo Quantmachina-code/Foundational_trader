@@ -171,7 +171,9 @@ def run_simulation(
         print(f"[engine] Simulating {len(all_dates)} trading days …")
 
     # ── 6. Main daily loop ────────────────────────────────────────────────
-    last_retrain_month: int = pd.Timestamp(sim_start).month - 1   # force first retrain
+    # Initial retrain was already performed above; record its month so the
+    # loop does not immediately retrain again on the first simulation day.
+    last_retrain_month: int = pd.Timestamp(sim_start).month
     prev_equity: float = initial_capital
 
     for i, date in enumerate(all_dates):

@@ -193,12 +193,17 @@ def _cross_section_rank(panel: pd.DataFrame, feature_cols: list[str]) -> pd.Data
 
     For each date, applies ``rank(pct=True)`` across all tickers within
     each feature column.  NaNs are left as NaN (not imputed here).
-    """
-    def rank_group(group: pd.DataFrame) -> pd.DataFrame:
-        group[feature_cols] = group[feature_cols].rank(pct=True)
-        return group
 
-    return panel.groupby("date", group_keys=False).apply(rank_group)
+    Uses ``transform`` (pandas 3.0 compatible) rather than ``apply`` so that
+    the ``date`` column is never consumed as a group key.
+    """
+    panel = panel.copy()
+    for col in feature_cols:
+        if col in panel.columns:
+            panel[col] = panel.groupby("date")[col].transform(
+                lambda s: s.rank(pct=True)
+            )
+    return panel
 
 
 # ---------------------------------------------------------------------------

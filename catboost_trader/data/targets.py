@@ -41,21 +41,17 @@ def build_targets(panel: pd.DataFrame, horizon: int) -> pd.DataFrame:
 
     panel = panel.copy()
     panel["date"] = pd.to_datetime(panel["date"])
+    panel = panel.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    # Compute raw forward return per ticker
-    def _fwd_return(grp: pd.DataFrame) -> pd.DataFrame:
-        grp = grp.sort_values("date")
-        grp["_fwd_ret"] = grp["close"].shift(-horizon) / grp["close"] - 1
-        return grp
+    # Compute raw forward return per ticker using transform (pandas 3.0 compatible)
+    panel["_fwd_ret"] = panel.groupby("ticker")["close"].transform(
+        lambda s: s.shift(-horizon) / s - 1
+    )
 
-    panel = panel.groupby("ticker", group_keys=False).apply(_fwd_return)
-
-    # Cross-sectional rank per date
-    def _cs_rank(grp: pd.DataFrame) -> pd.DataFrame:
-        grp["target"] = grp["_fwd_ret"].rank(pct=True)
-        return grp
-
-    panel = panel.groupby("date", group_keys=False).apply(_cs_rank)
+    # Cross-sectional rank per date using transform
+    panel["target"] = panel.groupby("date")["_fwd_ret"].transform(
+        lambda s: s.rank(pct=True)
+    )
     panel = panel.drop(columns=["_fwd_ret"])
 
     return panel.sort_values(["date", "ticker"]).reset_index(drop=True)
