@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# CatBoost training artifacts
+catboost_info/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data files (large, downloaded separately)
+data/fmp_ticker_cache/
+data/sp500_panel.parquet
+
+# Saved models
+models_saved/
+
+# Results
+results/
+
+# IDE
+.idea/
+.vscode/
+*.swp
